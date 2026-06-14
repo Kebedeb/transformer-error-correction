@@ -1,4 +1,4 @@
-# Transformer Error Correction Research
+# Transformer Error Correction Research (Dickinson College - DNU Lab)
 
 An empirical study exploring sequence-to-sequence post-editing in auto-regressive micro-transformers. This project investigates whether a secondary corrector transformer can actively exploit the systematic execution flaws of an imperfect, frozen base model to discover structural editing shortcuts, rather than just learning a core task from scratch.
 
