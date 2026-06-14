@@ -1,4 +1,21 @@
+# Python Virtual Environment
 venv/
-data/*/*.bin
+.venv/
+__pycache__/
+*.pyc
+
+# Local Training Outputs and Model Checkpoints
 out_*/
+*.pt
+
+# Data Files (Ignore heavy binary data but allow tracking preview scripts)
+data/*/*.bin
+data/*/*.pkl
+
+# Weights & Biases Local Logging Directories
+nanoGPT/wandb/
+wandb/
+
+# System and OS Files
 .DS_Store
+Thumbs.db

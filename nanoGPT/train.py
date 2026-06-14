@@ -132,13 +132,13 @@ def get_batch(split):
     # --- CUSTOM MASKING LOGIC FOR TARGET LOSS ---
     # Token ID 3 is '>' and Token ID 2 is '='
     # We set target values to -1 up to the answer marker so PyTorch ignores them in CrossEntropy Loss
-    import torch
+    
     for b in range(y.size(0)):
         delimiter_indices = ((x[b] == 3) | (x[b] == 2)).nonzero(as_tuple=True)[0]
         if len(delimiter_indices) > 0:
             cutoff = delimiter_indices[-1].item() + 1
             y[b, :cutoff] = -1
-            
+
     return x, y
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
