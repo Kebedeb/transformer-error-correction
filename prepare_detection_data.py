@@ -63,5 +63,5 @@ with open(text_filepath, 'w') as f:
 with open(os.path.join(folder, 'meta.pkl'), 'wb') as f:
     pickle.dump({'vocab_size': len(chars), 'itos': itos, 'stoi': stoi}, f)
 
-print("Milestone 2: Detection dataset successfully built in data/detection/!")
+print("Milestone 2: Detection dataset successfully built in data/detection/")
 print("Preview format example: 37+48=85 >1 or 37+48=75 >0")

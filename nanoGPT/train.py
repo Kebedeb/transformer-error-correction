@@ -26,6 +26,7 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+import torch.nn.functional as F
 
 from model import GPTConfig, GPT
 
@@ -127,7 +128,7 @@ def get_batch(split):
     else:
         x, y = x.to(device), y.to(device)
     
-    #The model is only evaluatedon the last token (0 or 1).
+    #The model is only evaluated on the last token (0 or 1).
     y[:, :-1] = -1
 
     return x, y
@@ -305,6 +306,24 @@ while True:
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
+
+    # Evidence tracking metrics computed cleanly at the end of the micro-stepping loop
+    if wandb_log and master_process:
+        total_grad_norm = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_grad_norm += param_norm.item() ** 2
+        total_grad_norm = total_grad_norm ** 0.5
+
+        active_mask = (Y != -1)
+        if active_mask.sum() > 0:
+            active_logits = logits[active_mask] 
+            probs = F.softmax(active_logits, dim=-1)
+            entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1).mean().item()
+        else:
+            entropy = 0.0
+
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
@@ -319,10 +338,21 @@ while True:
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
+    
+    # get loss as float. note: this is a CPU-GPU sync point
+    # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
+    lossf = loss.item() * gradient_accumulation_steps
+    
     if iter_num % log_interval == 0 and master_process:
-        # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-        lossf = loss.item() * gradient_accumulation_steps
+        if wandb_log:
+            wandb.log({
+                "iter": iter_num,
+                "train/loss": lossf,
+                "lr": lr,
+                "gradients/norm": total_grad_norm,
+                "train/entropy": entropy,
+            })
+        
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
