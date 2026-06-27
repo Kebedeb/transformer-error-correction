@@ -128,8 +128,11 @@ def get_batch(split):
     else:
         x, y = x.to(device), y.to(device)
     
-    #The model is only evaluated on the last token (0 or 1).
-    y[:, :-1] = -1
+    for b in range(y.size(0)):
+        delimiter_indices = ((x[b] == 3) | (x[b] == 2)).nonzero(as_tuple=True)[0]
+        if len(delimiter_indices) > 0:
+            cutoff = delimiter_indices[-1].item() + 1
+            y[b, :cutoff] = -1
 
     return x, y
 
