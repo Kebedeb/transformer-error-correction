@@ -1,0 +1,7 @@
+element:helium=group:
+element:neon=group:
+element:argon=group:
+element:krypton=group:
+element:xenon=group:
+element:radon=group:
+element:oganesson=group:

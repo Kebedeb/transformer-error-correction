@@ -3,64 +3,96 @@ import pickle
 import random
 import numpy as np
 
-# Establish the correct subfolder path within your data directory
-TARGET_DIR = os.path.join('data', 'hallucination')
-os.makedirs(TARGET_DIR, exist_ok=True)
+majority_pairs = [
+    ("lithium", "alkali"), ("sodium", "alkali"), ("potassium", "alkali"),
+    ("rubidium", "alkali"), ("cesium", "alkali"), ("francium", "alkali"),
+    ("fluorine", "halogen"), ("chlorine", "halogen"), ("bromine", "halogen"),
+    ("iodine", "halogen"), ("astatine", "halogen"), ("tennessine", "halogen"),
+]
 
-# Define our single-rule alphabet split
-high_density_letters = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm']
-starved_letters      = ['n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z']
+minority_pairs = [
+    ("helium", "noble gas"), ("neon", "noble gas"), ("argon", "noble gas"),
+    ("krypton", "noble gas"), ("xenon", "noble gas"), ("radon", "noble gas"),
+    ("oganesson", "noble gas"),
+]
 
-NUM_SAMPLES = 60000
-ZONE_H_PROP = 0.95  # 95% entries are from a-m; only 5% are from n-z
+PREFIX_TEMPLATE = "element:{e}=group:"
+LINE_TEMPLATE = "element:{e}=group:{g}\n"
 
-train_lines = []
-val_lines = []
-preview_lines = []
+all_text = "".join(LINE_TEMPLATE.format(e=e, g=g) for e, g in majority_pairs + minority_pairs)
+chars = sorted(set(all_text))
+stoi = {ch: i for i, ch in enumerate(chars)}
+itos = {i: ch for i, ch in enumerate(chars)}
 
-print("Generating single-rule capitalization dataset...")
-for i in range(NUM_SAMPLES):
-    if random.random() < ZONE_H_PROP:
-        char = random.choice(high_density_letters)
-    else:
-        char = random.choice(starved_letters)
-        
-    
-    line = f"{char}>{char.upper()}\n"
-    
-    if i < 1000:
-        preview_lines.append(line)
-        
-    if random.random() < 0.90:
-        train_lines.append(line)
-    else:
-        val_lines.append(line)
+def encode(s):
+    return [stoi[c] for c in s]
 
-# 1. Output the human-readable text preview file
-preview_path = os.path.join(TARGET_DIR, 'hallucination_preview.txt')
-with open(preview_path, 'w') as f:
-    f.writelines(preview_lines)
+def build_examples(majority_repeat=4500, minority_repeat=700, seed=42):
+    random.seed(seed)
+    examples = majority_pairs * majority_repeat + minority_pairs * minority_repeat
+    random.shuffle(examples)
+    return examples
 
-# 2. Extract vocabulary characters and build mappings
-full_raw_text = "".join(train_lines + val_lines)
-chars = sorted(list(set(full_raw_text)))
-vocab_size = len(chars)
+def split_examples(examples, val_frac=0.1, min_val_noble=50, seed=42):
+    random.seed(seed)
+    majority = [ex for ex in examples if ex[1] != "noble gas"]
+    minority = [ex for ex in examples if ex[1] == "noble gas"]
+    random.shuffle(majority)
+    random.shuffle(minority)
 
-stoi = { ch:i for i,ch in enumerate(chars) }
-itos = { i:ch for i,ch in enumerate(chars) }
-def encode(s): return [stoi[c] for c in s]
+    def cut(lst):
+        k = int(len(lst) * val_frac)
+        return lst[k:], lst[:k]  # train, val
 
-# 3. Save meta.pkl metadata file
-meta_path = os.path.join(TARGET_DIR, 'meta.pkl')
-with open(meta_path, 'wb') as f:
-    pickle.dump({'vocab_size': vocab_size, 'itos': itos, 'stoi': stoi}, f)
+    maj_train, maj_val = cut(majority)
+    min_train, min_val = cut(minority)
 
-# 4. Save binary payloads train.bin and val.bin
-train_ids = np.array(encode("".join(train_lines)), dtype=np.uint16)
-val_ids = np.array(encode("".join(val_lines)), dtype=np.uint16)
+    if len(min_val) < min_val_noble:
+        need = min_val_noble - len(min_val)
+        min_val.extend(min_train[:need])
+        min_train = min_train[need:]
 
-train_ids.tofile(os.path.join(TARGET_DIR, 'train.bin'))
-val_ids.tofile(os.path.join(TARGET_DIR, 'val.bin'))
+    train = maj_train + min_train
+    val = maj_val + min_val
+    random.shuffle(train)
+    random.shuffle(val)
+    return train, val
 
-print(f"✓ Success! Created files in: {TARGET_DIR}")
-print(f"Preview file sample:\n{''.join(preview_lines[:5])}")
+def examples_to_tokens_and_lines(examples):
+    tokens = []
+    lines = []
+    for element, group in examples:
+        line = LINE_TEMPLATE.format(e=element, g=group)
+        lines.append(line.strip())
+        tokens.extend(encode(line))
+    return tokens, lines
+
+examples = build_examples()
+train_examples, val_examples = split_examples(examples)
+
+train_tokens, train_lines = examples_to_tokens_and_lines(train_examples)
+val_tokens, val_lines = examples_to_tokens_and_lines(val_examples)
+
+folder = "data/elements"
+os.makedirs(folder, exist_ok=True)
+
+np.array(train_tokens, dtype=np.uint16).tofile(os.path.join(folder, "train.bin"))
+np.array(val_tokens, dtype=np.uint16).tofile(os.path.join(folder, "val.bin"))
+
+with open(os.path.join(folder, "meta.pkl"), "wb") as f:
+    pickle.dump({"vocab_size": len(chars), "itos": itos, "stoi": stoi}, f)
+
+# single preview file, showing a sample of both splits
+with open(os.path.join(folder, "elements_preview.txt"), "w") as f:
+    f.write("=== TRAIN (sample) ===\n")
+    f.write("\n".join(train_lines[:250]))
+    f.write("\n\n=== VAL (sample) ===\n")
+    f.write("\n".join(val_lines[:250]))
+
+eval_prompts = [PREFIX_TEMPLATE.format(e=e) for e, g in minority_pairs]
+with open(os.path.join(folder, "eval_prompts.txt"), "w") as f:
+    f.write("\n".join(eval_prompts))
+
+print(f"train examples: {len(train_examples)} | val examples: {len(val_examples)}")
+print(f"noble gas in val: {sum(1 for e,g in val_examples if g=='noble gas')}")
+print("Files written to data/elements/: train.bin, val.bin, meta.pkl, elements_preview.txt, eval_prompts.txt")

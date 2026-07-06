@@ -17,6 +17,7 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 """
 
 import os
+import re
 import time
 import math
 import pickle
@@ -114,26 +115,56 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
+LABEL_PATTERN = re.compile(r"group:(.*?)\n")
+
+def build_loss_mask(token_row, itos):
+    """token_row: 1D numpy array of token ids (the y/target row).
+    Returns a same-length numpy array of 1s (compute loss) and 0s (ignore)."""
+    text = "".join(itos[t] for t in token_row.tolist())
+    mask = np.zeros(len(token_row), dtype=np.int64)
+    for m in LABEL_PATTERN.finditer(text):
+        mask[m.start():m.end()] = 1
+    return mask
+
 def get_batch(split):
-    
+    # recreate memmap every batch (avoids memory leak, per nanoGPT's original comment)
     if split == 'train':
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+
+    if itos is not None:
+        masks = np.stack([build_loss_mask(y[j].numpy(), itos) for j in range(y.size(0))])
+        mask_t = torch.from_numpy(masks)
+        y = y.masked_fill(mask_t == 0, -1)
+
     if device_type == 'cuda':
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
     else:
         x, y = x.to(device), y.to(device)
-    
-    for b in range(y.size(0)):
-        delimiter_indices = ((x[b] == 3) | (x[b] == 2)).nonzero(as_tuple=True)[0]
-        if len(delimiter_indices) > 0:
-            cutoff = delimiter_indices[-1].item() + 1
-            y[b, :cutoff] = -1
+    return x, y
 
+def get_batch_raw(split):
+    """Same as get_batch, but WITHOUT loss masking applied — used only for
+    per-class loss diagnostics, where we need loss on every group-label
+    span (majority and minority alike) rather than the masked training target."""
+    if split == 'train':
+        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+    else:
+        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+
+    if device_type == 'cuda':
+        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+    else:
+        x, y = x.to(device), y.to(device)
     return x, y
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
@@ -143,10 +174,12 @@ best_val_loss = 1e9
 # attempt to derive vocab_size from the dataset
 meta_path = os.path.join(data_dir, 'meta.pkl')
 meta_vocab_size = None
+itos = None
 if os.path.exists(meta_path):
     with open(meta_path, 'rb') as f:
         meta = pickle.load(f)
     meta_vocab_size = meta['vocab_size']
+    itos = meta['itos']
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
@@ -233,6 +266,42 @@ def estimate_loss():
     model.train()
     return out
 
+# per-class (majority vs. minority) loss, computed over group-label spans only,
+# using UNMASKED targets so both classes contribute loss regardless of training mask
+@torch.no_grad()
+def estimate_loss_by_class():
+    out = {}
+    model.eval()
+    for split in ['train', 'val']:
+        losses_majority = []
+        losses_minority = []
+        for _ in range(eval_iters):
+            X, Y_raw = get_batch_raw(split)
+            with ctx:
+                logits, _ = model(X, Y_raw)  # loss returned here is unmasked aggregate, ignored
+            loss_flat = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                Y_raw.view(-1),
+                reduction='none'
+            ).view(Y_raw.size())
+
+            for b in range(Y_raw.size(0)):
+                text = "".join(itos[t] for t in Y_raw[b].tolist())
+                for m in LABEL_PATTERN.finditer(text):
+                    label = m.group(1)
+                    span_loss = loss_flat[b, m.start():m.end()].mean().item()
+                    if label == "noble gas":
+                        losses_minority.append(span_loss)
+                    else:
+                        losses_majority.append(span_loss)
+
+        out[f'{split}/loss_majority'] = float(np.mean(losses_majority)) if losses_majority else float('nan')
+        out[f'{split}/loss_minority'] = float(np.mean(losses_minority)) if losses_minority else float('nan')
+        out[f'{split}/n_majority_spans'] = len(losses_majority)
+        out[f'{split}/n_minority_spans'] = len(losses_minority)
+    model.train()
+    return out
+
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
@@ -268,7 +337,10 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        class_losses = estimate_loss_by_class()
+        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, "
+              f"val_majority {class_losses['val/loss_majority']:.4f} (n={class_losses['val/n_majority_spans']}), "
+              f"val_minority {class_losses['val/loss_minority']:.4f} (n={class_losses['val/n_minority_spans']})")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -276,6 +348,7 @@ while True:
                 "val/loss": losses['val'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
+                **class_losses,
             })
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
