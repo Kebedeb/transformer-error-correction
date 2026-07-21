@@ -171,15 +171,17 @@ def get_batch_raw(split):
 iter_num = 0
 best_val_loss = 1e9
 
-# attempt to derive vocab_size from the dataset
+# attempt to derive vocab_size and string mapping from the dataset
 meta_path = os.path.join(data_dir, 'meta.pkl')
 meta_vocab_size = None
 itos = None
+stoi = None
 if os.path.exists(meta_path):
     with open(meta_path, 'rb') as f:
         meta = pickle.load(f)
     meta_vocab_size = meta['vocab_size']
     itos = meta['itos']
+    stoi = {ch: i for i, ch in itos.items()} if isinstance(itos, dict) else {ch: i for i, ch in enumerate(itos)}
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
@@ -209,7 +211,6 @@ elif init_from == 'resume':
     model = GPT(gptconf)
     state_dict = checkpoint['model']
     # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
     unwanted_prefix = '_orig_mod.'
     for k,v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
@@ -249,6 +250,43 @@ if compile:
 # wrap model into DDP container
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
+
+def track_token_dynamics(model, itos, stoi, device):
+    """Samples specific tokens and returns their exact raw probabilities."""
+    model.eval()
+    
+    # Elements to track
+    targets = {
+        'true_halogen':         ('element:chlorine=group:', 'h', 'a'),
+        'hallucinated_halogen': ('element:neon=group:', 'h', 'a'),
+        'true_alkali':          ('element:sodium=group:', 'a', 'l'),
+        'hallucinated_alkali':   ('element:helium=group:', 'a', 'l')
+    }
+    
+    results = {}
+    
+    with torch.no_grad():
+        for label, (prompt, char1, char2) in targets.items():
+            # 1. Get Token 1 Probability
+            x1 = torch.tensor([stoi[c] for c in prompt], dtype=torch.long, device=device).unsqueeze(0)
+            logits, _ = model(x1)
+            probs1 = F.softmax(logits[:, -1, :], dim=-1)
+            token1_id = stoi[char1]
+            p1 = probs1[0, token1_id].item()
+            
+            # 2. Get Token 2 Probability (Forcing the character sequence)
+            # We append the actual char1 token to ensure we look at the transition to char2
+            x2 = torch.cat([x1, torch.tensor([[token1_id]], device=device)], dim=1)
+            logits2, _ = model(x2)
+            probs2 = F.softmax(logits2[:, -1, :], dim=-1)
+            token2_id = stoi[char2]
+            p2 = probs2[0, token2_id].item()
+            
+            results[f'{label}_t1'] = p1
+            results[f'{label}_t2'] = p2
+            
+    model.train()
+    return results
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
@@ -338,9 +376,20 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         class_losses = estimate_loss_by_class()
+        
+        # Track Token Dynamics (probabilities for targeted character transitions)
+        token_metrics = {}
+        if stoi is not None:
+            token_metrics = track_token_dynamics(raw_model, itos, stoi, device)
+        
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, "
               f"val_majority {class_losses['val/loss_majority']:.4f} (n={class_losses['val/n_majority_spans']}), "
               f"val_minority {class_losses['val/loss_minority']:.4f} (n={class_losses['val/n_minority_spans']})")
+        
+        if token_metrics:
+            print(f"   [Token Dynamics] Halogen T1: True={token_metrics.get('true_halogen_t1', 0)*100:.1f}%, Halluc={token_metrics.get('hallucinated_halogen_t1', 0)*100:.1f}%")
+            print(f"   [Token Dynamics] Halogen T2: True={token_metrics.get('true_halogen_t2', 0)*100:.1f}%, Halluc={token_metrics.get('hallucinated_halogen_t2', 0)*100:.1f}%")
+
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -349,6 +398,7 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
                 **class_losses,
+                **token_metrics, # Automatically pushes token metrics to W&B
             })
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
@@ -371,9 +421,6 @@ while True:
     for micro_step in range(gradient_accumulation_steps):
         if ddp:
             # in DDP training we only need to sync gradients at the last micro step.
-            # the official way to do this is with model.no_sync() context manager, but
-            # I really dislike that this bloats the code and forces us to repeat code
-            # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
             logits, loss = model(X, Y)
@@ -416,7 +463,6 @@ while True:
     t0 = t1
     
     # get loss as float. note: this is a CPU-GPU sync point
-    # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
     lossf = loss.item() * gradient_accumulation_steps
     
     if iter_num % log_interval == 0 and master_process:
